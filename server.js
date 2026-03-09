@@ -81,13 +81,16 @@ app.post("/messages", (req, res) => {
 
   const id = randomUUID();
   const ts = Date.now();
-  const liveDuration = Math.min(Math.max(parseInt(ttl) || 86400, 60), 604800); // entre 1min et 7 jours
+  const liveDuration = Math.min(Math.max(parseInt(ttl) || 86400, 60), 604800);
   const expires_at = ts + liveDuration * 1000;
+
+  // Stocke en base64 pour préserver les symboles Unicode
+  const encryptedStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
 
   db.prepare(`
     INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encrypted || "", hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at);
+  `).run(id, from, to, encryptedStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at);
 
   console.log(`[msg] ${from} → ${to} | id: ${id.slice(0, 8)}...`);
   res.json({ id, ts });
@@ -122,7 +125,8 @@ app.get("/messages/:userId", (req, res) => {
     id: m.id,
     from: m.from_id,
     to: m.to_id,
-    encrypted: m.encrypted,
+    // Décode le base64 pour restituer les symboles Unicode originaux
+    encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
     hasFile: m.has_file === 1,
     fileName: m.file_name,
     fileData: m.file_data,
