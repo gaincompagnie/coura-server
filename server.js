@@ -54,8 +54,15 @@ app.use(express.static(path.join(__dirname, "public")));
 const clients = new Map(); // userId → Set<WebSocket>
 
 function register(userId, ws) {
-  if (!clients.has(userId)) clients.set(userId, new Set());
-  clients.get(userId).add(ws);
+  // Ferme les anciennes connexions pour éviter les doublons
+  if (clients.has(userId)) {
+    for (const oldWs of clients.get(userId)) {
+      if (oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
+        oldWs.close();
+      }
+    }
+  }
+  clients.set(userId, new Set([ws]));
 }
 function unregister(userId, ws) {
   const set = clients.get(userId);
