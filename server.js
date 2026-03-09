@@ -87,6 +87,12 @@ wss.on("connection", (ws) => {
     try {
       const msg = JSON.parse(raw);
 
+      // Keepalive
+      if (msg.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong" }));
+        return;
+      }
+
       if (msg.type === "register" && msg.userId) {
         myId = msg.userId;
         register(myId, ws);
