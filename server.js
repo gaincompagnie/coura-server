@@ -36,7 +36,6 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at);
 `);
 
-// Migrations silencieuses
 try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catch {}
 
 // ── Nettoyage auto ──────────────────────────────────
@@ -50,19 +49,12 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-// ── Registre WebSocket : userId → Set<ws> ──────────
-const clients = new Map(); // userId → Set<WebSocket>
+// ── Registre WebSocket ──────────────────────────────
+const clients = new Map();
 
 function register(userId, ws) {
-  // Ferme les anciennes connexions pour éviter les doublons
-  if (clients.has(userId)) {
-    for (const oldWs of clients.get(userId)) {
-      if (oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
-        oldWs.close();
-      }
-    }
-  }
-  clients.set(userId, new Set([ws]));
+  if (!clients.has(userId)) clients.set(userId, new Set());
+  clients.get(userId).add(ws);
 }
 function unregister(userId, ws) {
   const set = clients.get(userId);
@@ -79,26 +71,33 @@ function push(userId, payload) {
   }
 }
 
+// ── Keepalive natif — ping toutes les 25s ──────────
+setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 25000);
+
 // ── WebSocket ───────────────────────────────────────
 wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
   let myId = null;
 
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw);
 
-      // Keepalive
-      if (msg.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
-        return;
-      }
+      if (msg.type === "ping") { ws.send(JSON.stringify({ type: "pong" })); return; }
 
       if (msg.type === "register" && msg.userId) {
         myId = msg.userId;
         register(myId, ws);
         ws.send(JSON.stringify({ type: "registered", userId: myId }));
 
-        // Envoie les messages non lus en attente
         const now = Date.now();
         const pending = db.prepare(`
           SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at
@@ -119,10 +118,9 @@ wss.on("connection", (ws) => {
             }));
           }
         }
+        return;
       }
 
-      // ── Signaling WebRTC ────────────────────────────
-      // Relaie les messages de signaling (offer, answer, candidate, call-*, etc.)
       if (["call-offer","call-answer","call-reject","call-end","ice-candidate"].includes(msg.type)) {
         if (msg.to) push(msg.to, { ...msg, from: myId });
       }
@@ -138,96 +136,45 @@ wss.on("connection", (ws) => {
 
 app.get("/ping", (req, res) => res.json({ status: "ok", ts: Date.now() }));
 
-/**
- * POST /messages — Envoyer un message
- */
 app.post("/messages", (req, res) => {
   const { from, to, encrypted, hasFile, fileName, fileData, ttl, nokey } = req.body;
+  if (!from || !to || (!encrypted && !hasFile)) return res.status(400).json({ error: "Paramètres manquants" });
+  if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
+  if (encrypted && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
 
-  if (!from || !to || (!encrypted && !hasFile))
-    return res.status(400).json({ error: "Paramètres manquants" });
-  if (from.length > 20 || to.length > 20)
-    return res.status(400).json({ error: "Identifiant invalide" });
-  if (encrypted && encrypted.length > 500_000)
-    return res.status(400).json({ error: "Message trop long" });
-
-  const id          = randomUUID();
-  const ts          = Date.now();
+  const id = randomUUID(), ts = Date.now();
   const liveDuration = Math.min(Math.max(parseInt(ttl) || 86400, 60), 604800);
-  const expires_at  = ts + liveDuration * 1000;
-  const encStored   = Buffer.from(encrypted || "", 'utf8').toString('base64');
+  const expires_at = ts + liveDuration * 1000;
+  const encStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
 
-  db.prepare(`
-    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at, nokey)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at, nokey ? 1 : 0);
+  db.prepare(`INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at, nokey) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at, nokey ? 1 : 0);
 
-  // Push WebSocket immédiat au destinataire
-  push(to, {
-    type: "message",
-    id, from, to,
-    encrypted: encrypted || "",
-    hasFile: !!hasFile,
-    fileName: fileName || null,
-    fileData: fileData || null,
-    ts,
-    ttl: liveDuration,
-    nokey: !!nokey
-  });
-
-  // Marque comme lu si destinataire connecté
-  if (clients.has(to)) {
-    db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
-  }
+  push(to, { type: "message", id, from, to, encrypted: encrypted || "", hasFile: !!hasFile, fileName: fileName || null, fileData: fileData || null, ts, ttl: liveDuration, nokey: !!nokey });
+  if (clients.has(to)) db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
 
   console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)}`);
   res.json({ id, ts });
 });
 
-/**
- * GET /messages/:userId — Fallback polling (si WS non connecté)
- */
 app.get("/messages/:userId", (req, res) => {
   const { userId } = req.params;
-  if (!userId || userId.length > 20)
-    return res.status(400).json({ error: "Identifiant invalide" });
-
-  const now  = Date.now();
-  const msgs = db.prepare(`
-    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at
-    FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ?
-    ORDER BY ts ASC
-  `).all(userId, now);
-
-  if (msgs.length > 0) {
-    const ids = msgs.map(m => `'${m.id}'`).join(",");
-    db.exec(`UPDATE messages SET read = 1 WHERE id IN (${ids})`);
-  }
-
-  res.json(msgs.map(m => ({
-    id: m.id, from: m.from_id, to: m.to_id,
-    encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
-    hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data,
-    ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1
-  })));
+  if (!userId || userId.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
+  const now = Date.now();
+  const msgs = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ? ORDER BY ts ASC`).all(userId, now);
+  if (msgs.length > 0) db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
+  res.json(msgs.map(m => ({ id: m.id, from: m.from_id, to: m.to_id, encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "", hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data, ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1 })));
 });
 
-/**
- * DELETE /messages/:id — Supprime un message et notifie le destinataire
- */
 app.delete("/messages/:id", (req, res) => {
   const { id } = req.params;
   const msg = db.prepare("SELECT id, to_id FROM messages WHERE id = ?").get(id);
   if (!msg) return res.status(404).json({ error: "Message introuvable" });
   db.prepare("DELETE FROM messages WHERE id = ?").run(id);
-
-  // Push suppression immédiate via WebSocket
   push(msg.to_id, { type: "deleted", id });
-
   res.json({ deleted: true });
 });
 
-// ── Démarrage ────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`\n✅ COURA Server (WebSocket) démarré sur le port ${PORT}\n`);
 });
