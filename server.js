@@ -27,12 +27,16 @@ db.exec(`
     file_data   TEXT,
     ts          INTEGER NOT NULL,
     read        INTEGER DEFAULT 0,
-    expires_at  INTEGER NOT NULL
+    expires_at  INTEGER NOT NULL,
+    nokey       INTEGER DEFAULT 0
   );
 
   CREATE INDEX IF NOT EXISTS idx_to_id ON messages(to_id);
   CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at);
 `);
+
+// ── Migration : ajoute nokey si absent ─────────────
+try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catch {}
 
 // ── Nettoyage automatique des messages expirés ──────
 // Toutes les 60 secondes, supprime les messages lus ou expirés
@@ -66,7 +70,7 @@ app.get("/ping", (req, res) => {
  * ttl = durée de vie en secondes (défaut: 86400 = 24h)
  */
 app.post("/messages", (req, res) => {
-  const { from, to, encrypted, hasFile, fileName, fileData, ttl } = req.body;
+  const { from, to, encrypted, hasFile, fileName, fileData, ttl, nokey } = req.body;
 
   // Validation minimale
   if (!from || !to || (!encrypted && !hasFile)) {
@@ -88,9 +92,9 @@ app.post("/messages", (req, res) => {
   const encryptedStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
 
   db.prepare(`
-    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encryptedStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at);
+    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at, nokey)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, from, to, encryptedStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at, nokey ? 1 : 0);
 
   console.log(`[msg] ${from} → ${to} | id: ${id.slice(0, 8)}...`);
   res.json({ id, ts });
@@ -109,7 +113,7 @@ app.get("/messages/:userId", (req, res) => {
 
   const now = Date.now();
   const msgs = db.prepare(`
-    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts
+    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey
     FROM messages
     WHERE to_id = ? AND read = 0 AND expires_at > ?
     ORDER BY ts ASC
@@ -125,12 +129,12 @@ app.get("/messages/:userId", (req, res) => {
     id: m.id,
     from: m.from_id,
     to: m.to_id,
-    // Décode le base64 pour restituer les symboles Unicode originaux
     encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
     hasFile: m.has_file === 1,
     fileName: m.file_name,
     fileData: m.file_data,
-    ts: m.ts
+    ts: m.ts,
+    nokey: m.nokey === 1
   })));
 });
 
