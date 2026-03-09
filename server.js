@@ -42,7 +42,7 @@ try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catc
 // Toutes les 60 secondes, supprime les messages lus ou expirés
 setInterval(() => {
   const now = Date.now();
-  const deleted = db.prepare("DELETE FROM messages WHERE expires_at < ? OR read = 1").run(now);
+  const deleted = db.prepare("DELETE FROM messages WHERE expires_at < ?").run(now);
   if (deleted.changes > 0) {
     console.log(`[cleanup] ${deleted.changes} message(s) supprimé(s)`);
   }
@@ -119,7 +119,7 @@ app.get("/messages/:userId", (req, res) => {
     ORDER BY ts ASC
   `).all(userId, now);
 
-  // Marque comme lus (seront supprimés au prochain nettoyage)
+  // Marque comme lus mais ne supprime pas — effacement uniquement au TTL ou sur DELETE
   if (msgs.length > 0) {
     const ids = msgs.map(m => `'${m.id}'`).join(",");
     db.exec(`UPDATE messages SET read = 1 WHERE id IN (${ids})`);
@@ -151,6 +151,18 @@ app.get("/messages/:userId/count", (req, res) => {
     WHERE to_id = ? AND read = 0 AND expires_at > ?
   `).get(userId, now);
   res.json({ count: row.count });
+});
+
+/**
+ * DELETE /messages/:id
+ * Supprime un message non encore lu
+ */
+app.delete("/messages/:id", (req, res) => {
+  const { id } = req.params;
+  const msg = db.prepare("SELECT id FROM messages WHERE id = ?").get(id);
+  if (!msg) return res.status(404).json({ error: "Message introuvable" });
+  db.prepare("DELETE FROM messages WHERE id = ?").run(id);
+  res.json({ deleted: true });
 });
 
 // ── Démarrage ────────────────────────────────────────
