@@ -79,6 +79,7 @@ wss.on("connection", (ws) => {
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw);
+
       if (msg.type === "register" && msg.userId) {
         myId = msg.userId;
         register(myId, ws);
@@ -98,20 +99,21 @@ wss.on("connection", (ws) => {
           for (const m of pending) {
             ws.send(JSON.stringify({
               type: "message",
-              id: m.id,
-              from: m.from_id,
-              to: m.to_id,
+              id: m.id, from: m.from_id, to: m.to_id,
               encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
-              hasFile: m.has_file === 1,
-              fileName: m.file_name,
-              fileData: m.file_data,
-              ts: m.ts,
-              ttl: Math.round((m.expires_at - m.ts) / 1000),
-              nokey: m.nokey === 1
+              hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data,
+              ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1
             }));
           }
         }
       }
+
+      // ── Signaling WebRTC ────────────────────────────
+      // Relaie les messages de signaling (offer, answer, candidate, call-*, etc.)
+      if (["call-offer","call-answer","call-reject","call-end","ice-candidate"].includes(msg.type)) {
+        if (msg.to) push(msg.to, { ...msg, from: myId });
+      }
+
     } catch {}
   });
 
