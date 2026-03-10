@@ -175,7 +175,7 @@ app.get("/messages/:userId", (req, res) => {
   const now = Date.now();
   const msgs = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ? ORDER BY ts ASC`).all(userId, now);
   if (msgs.length > 0) db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
-  res.json(msgs.map(m => ({ id: m.id, from: m.from_id, to: m.to_id, encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "", hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data, ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1 })));
+  res.json(msgs.map(m => ({ id: m.id, from: m.from_id, to: m.to_id, encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "", hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data, ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1, isVoice: m.is_voice === 1 })));
 });
 
 app.delete("/messages/:id", (req, res) => {
