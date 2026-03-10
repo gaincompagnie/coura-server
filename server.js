@@ -43,8 +43,17 @@ db.exec(`
     public_key  TEXT NOT NULL,
     updated_at  INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id  TEXT PRIMARY KEY,
+    user_a      TEXT NOT NULL,
+    user_b      TEXT NOT NULL,
+    state_a     TEXT,
+    state_b     TEXT,
+    updated_at  INTEGER NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS idx_to_id ON messages(to_id);
   CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_session_ab ON sessions(user_a, user_b);
 `);
 
 // Migrations silencieuses
@@ -185,6 +194,66 @@ app.get("/keys/:userId", (req, res) => {
   const row = db.prepare("SELECT public_key FROM keys WHERE user_id = ?").get(userId);
   if (!row) return res.status(404).json({ error: "Clé introuvable" });
   res.json({ userId, publicKey: row.public_key });
+});
+
+// ══════════════════════════════════════════════════════
+// SESSIONS — État Double Ratchet chiffré
+// Le serveur stocke l'état de session chiffré côté client
+// Il ne peut pas le lire — il est chiffré avec les clés des utilisateurs
+// ══════════════════════════════════════════════════════
+
+// Obtenir l'ID de session canonique (toujours A < B alphabétiquement)
+function sessionId(a, b) {
+  return [a, b].sort().join(":");
+}
+
+// Sauvegarder l'état de session d'un utilisateur
+app.post("/sessions/:userId", (req, res) => {
+  const userId = req.params.userId.toUpperCase();
+  const { peerId, state } = req.body;
+  if (!userId || !peerId || !state) return res.status(400).json({ error: "Paramètres manquants" });
+  if (state.length > 100_000) return res.status(400).json({ error: "État trop grand" });
+
+  const sid = sessionId(userId, peerId.toUpperCase());
+  const existing = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sid);
+  const now = Date.now();
+
+  if (existing) {
+    // Mettre à jour l'état de l'utilisateur concerné
+    const col = existing.user_a === userId ? "state_a" : "state_b";
+    db.prepare(`UPDATE sessions SET ${col} = ?, updated_at = ? WHERE session_id = ?`).run(state, now, sid);
+  } else {
+    // Créer la session
+    const [userA, userB] = [userId, peerId.toUpperCase()].sort();
+    const stateA = userA === userId ? state : null;
+    const stateB = userB === userId ? state : null;
+    db.prepare("INSERT INTO sessions (session_id, user_a, user_b, state_a, state_b, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(sid, userA, userB, stateA, stateB, now);
+  }
+
+  res.json({ ok: true });
+});
+
+// Récupérer l'état de session pour un utilisateur
+app.get("/sessions/:userId/:peerId", (req, res) => {
+  const userId = req.params.userId.toUpperCase();
+  const peerId = req.params.peerId.toUpperCase();
+  const sid = sessionId(userId, peerId);
+  const session = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sid);
+  if (!session) return res.status(404).json({ error: "Session introuvable" });
+
+  // Retourner l'état de l'utilisateur demandeur
+  const state = session.user_a === userId ? session.state_a : session.state_b;
+  res.json({ state: state || null });
+});
+
+// Supprimer une session (reset des clés)
+app.delete("/sessions/:userId/:peerId", (req, res) => {
+  const userId = req.params.userId.toUpperCase();
+  const peerId = req.params.peerId.toUpperCase();
+  const sid = sessionId(userId, peerId);
+  db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sid);
+  res.json({ deleted: true });
 });
 
 // ── Messages ─────────────────────────────────────────
