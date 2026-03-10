@@ -31,18 +31,26 @@ db.exec(`
     read        INTEGER DEFAULT 0,
     expires_at  INTEGER NOT NULL,
     nokey       INTEGER DEFAULT 0,
-    is_voice    INTEGER DEFAULT 0
+    is_voice    INTEGER DEFAULT 0,
+    file_type   TEXT
   );
   CREATE TABLE IF NOT EXISTS users (
     id         TEXT PRIMARY KEY,
     last_seen  INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS keys (
+    user_id     TEXT PRIMARY KEY,
+    public_key  TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS idx_to_id ON messages(to_id);
   CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at);
 `);
 
+// Migrations silencieuses
 try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE messages ADD COLUMN is_voice INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN file_type TEXT`); } catch {}
 
 // ── Nettoyage auto ──────────────────────────────────
 setInterval(() => {
@@ -61,7 +69,6 @@ const clients = new Map();
 function register(userId, ws) {
   if (!clients.has(userId)) clients.set(userId, new Set());
   clients.get(userId).add(ws);
-  // Enregistre l'ID dans la table users
   db.prepare("INSERT OR REPLACE INTO users (id, last_seen) VALUES (?, ?)").run(userId, Date.now());
 }
 function unregister(userId, ws) {
@@ -87,7 +94,6 @@ wss.on("connection", (ws) => {
     try {
       const msg = JSON.parse(raw);
 
-      // Keepalive JSON — le client ping toutes les 20s
       if (msg.type === "ping") {
         ws.send(JSON.stringify({ type: "pong" }));
         return;
@@ -100,7 +106,7 @@ wss.on("connection", (ws) => {
 
         const now = Date.now();
         const pending = db.prepare(`
-          SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at
+          SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at
           FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ?
           ORDER BY ts ASC
         `).all(myId, now);
@@ -113,8 +119,14 @@ wss.on("connection", (ws) => {
               type: "message",
               id: m.id, from: m.from_id, to: m.to_id,
               encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
-              hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data,
-              ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1, isVoice: m.is_voice === 1
+              hasFile: m.has_file === 1,
+              fileName: m.file_name,
+              fileData: m.file_data,
+              fileType: m.file_type || "",
+              ts: m.ts,
+              ttl: Math.round((m.expires_at - m.ts) / 1000),
+              nokey: m.nokey === 1,
+              isVoice: m.is_voice === 1
             }));
           }
         }
@@ -137,6 +149,7 @@ wss.on("connection", (ws) => {
 
 app.get("/ping", (req, res) => res.json({ status: "ok", ts: Date.now() }));
 
+// ── Vérifier si un utilisateur existe ──
 app.get("/user/:userId", (req, res) => {
   const userId = req.params.userId.toUpperCase();
   const liveNow = clients.has(userId);
@@ -148,8 +161,36 @@ app.get("/user/:userId", (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════
+// PREKEYS — Clés publiques pour chiffrement E2E
+// ══════════════════════════════════════════════════════
+
+// Déposer sa clé publique sur le serveur
+app.post("/keys/register", (req, res) => {
+  const { userId, publicKey } = req.body;
+  if (!userId || !publicKey) return res.status(400).json({ error: "userId et publicKey requis" });
+  if (userId.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
+  if (publicKey.length > 2000) return res.status(400).json({ error: "Clé invalide" });
+
+  db.prepare("INSERT OR REPLACE INTO keys (user_id, public_key, updated_at) VALUES (?, ?, ?)")
+    .run(userId.toUpperCase(), publicKey, Date.now());
+
+  console.log(`[keys] Clé publique enregistrée pour ${userId}`);
+  res.json({ ok: true });
+});
+
+// Récupérer la clé publique d'un utilisateur
+app.get("/keys/:userId", (req, res) => {
+  const userId = req.params.userId.toUpperCase();
+  const row = db.prepare("SELECT public_key FROM keys WHERE user_id = ?").get(userId);
+  if (!row) return res.status(404).json({ error: "Clé introuvable" });
+  res.json({ userId, publicKey: row.public_key });
+});
+
+// ── Messages ─────────────────────────────────────────
+
 app.post("/messages", (req, res) => {
-  const { from, to, encrypted, hasFile, fileName, fileData, ttl, nokey, isVoice } = req.body;
+  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice } = req.body;
   if (!from || !to || (!encrypted && !hasFile)) return res.status(400).json({ error: "Paramètres manquants" });
   if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
   if (encrypted && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
@@ -159,13 +200,26 @@ app.post("/messages", (req, res) => {
   const expires_at = ts + liveDuration * 1000;
   const encStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
 
-  db.prepare(`INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, expires_at, nokey, is_voice) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0);
+  db.prepare(`
+    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, expires_at, nokey, is_voice)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0);
 
-  push(to, { type: "message", id, from, to, encrypted: encrypted || "", hasFile: !!hasFile, fileName: fileName || null, fileData: fileData || null, ts, ttl: liveDuration, nokey: !!nokey, isVoice: !!isVoice });
+  push(to, {
+    type: "message", id, from, to,
+    encrypted: encrypted || "",
+    hasFile: !!hasFile,
+    fileName: fileName || null,
+    fileData: fileData || null,
+    fileType: fileType || "",
+    ts, ttl: liveDuration,
+    nokey: !!nokey,
+    isVoice: !!isVoice
+  });
+
   if (clients.has(to)) db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
 
-  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)}`);
+  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey}`);
   res.json({ id, ts });
 });
 
@@ -173,9 +227,28 @@ app.get("/messages/:userId", (req, res) => {
   const { userId } = req.params;
   if (!userId || userId.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
   const now = Date.now();
-  const msgs = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, ts, nokey, expires_at FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ? ORDER BY ts ASC`).all(userId, now);
-  if (msgs.length > 0) db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
-  res.json(msgs.map(m => ({ id: m.id, from: m.from_id, to: m.to_id, encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "", hasFile: m.has_file === 1, fileName: m.file_name, fileData: m.file_data, ts: m.ts, ttl: Math.round((m.expires_at - m.ts) / 1000), nokey: m.nokey === 1, isVoice: m.is_voice === 1 })));
+  const msgs = db.prepare(`
+    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at
+    FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ?
+    ORDER BY ts ASC
+  `).all(userId, now);
+
+  if (msgs.length > 0) {
+    db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
+  }
+
+  res.json(msgs.map(m => ({
+    id: m.id, from: m.from_id, to: m.to_id,
+    encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
+    hasFile: m.has_file === 1,
+    fileName: m.file_name,
+    fileData: m.file_data,
+    fileType: m.file_type || "",
+    ts: m.ts,
+    ttl: Math.round((m.expires_at - m.ts) / 1000),
+    nokey: m.nokey === 1,
+    isVoice: m.is_voice === 1
+  })));
 });
 
 app.delete("/messages/:id", (req, res) => {
@@ -188,5 +261,5 @@ app.delete("/messages/:id", (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n✅ COURA Server (WebSocket) démarré sur le port ${PORT}\n`);
+  console.log(`\n✅ COURA Server (WebSocket + Prekeys) démarré sur le port ${PORT}\n`);
 });
