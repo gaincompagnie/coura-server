@@ -33,6 +33,10 @@ db.exec(`
     nokey       INTEGER DEFAULT 0,
     is_voice    INTEGER DEFAULT 0
   );
+  CREATE TABLE IF NOT EXISTS users (
+    id         TEXT PRIMARY KEY,
+    last_seen  INTEGER NOT NULL
+  );
   CREATE INDEX IF NOT EXISTS idx_to_id ON messages(to_id);
   CREATE INDEX IF NOT EXISTS idx_expires ON messages(expires_at);
 `);
@@ -57,6 +61,9 @@ const clients = new Map();
 function register(userId, ws) {
   if (!clients.has(userId)) clients.set(userId, new Set());
   clients.get(userId).add(ws);
+  // Enregistre l'ID dans la table users
+  db.prepare("INSERT OR REPLACE INTO users (id, last_seen) VALUES (?, ?)").run(userId, Date.now());
+}
 }
 function unregister(userId, ws) {
   const set = clients.get(userId);
@@ -130,6 +137,17 @@ wss.on("connection", (ws) => {
 // ── ROUTES HTTP ─────────────────────────────────────
 
 app.get("/ping", (req, res) => res.json({ status: "ok", ts: Date.now() }));
+
+app.get("/user/:userId", (req, res) => {
+  const userId = req.params.userId.toUpperCase();
+  const liveNow = clients.has(userId);
+  const inDb = db.prepare("SELECT 1 FROM users WHERE id = ? LIMIT 1").get(userId);
+  if (liveNow || inDb) {
+    res.json({ exists: true });
+  } else {
+    res.status(404).json({ exists: false });
+  }
+});
 
 app.post("/messages", (req, res) => {
   const { from, to, encrypted, hasFile, fileName, fileData, ttl, nokey, isVoice } = req.body;
