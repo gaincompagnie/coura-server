@@ -64,7 +64,6 @@ function register(userId, ws) {
   // Enregistre l'ID dans la table users
   db.prepare("INSERT OR REPLACE INTO users (id, last_seen) VALUES (?, ?)").run(userId, Date.now());
 }
-}
 function unregister(userId, ws) {
   const set = clients.get(userId);
   if (!set) return;
