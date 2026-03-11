@@ -58,6 +58,7 @@ db.exec(`
 
 // Migrations silencieuses
 try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN seen INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE messages ADD COLUMN is_voice INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE messages ADD COLUMN file_type TEXT`); } catch {}
 
@@ -123,6 +124,10 @@ wss.on("connection", (ws) => {
         if (pending.length > 0) {
           const ids = pending.map(m => `'${m.id}'`).join(",");
           db.exec(`UPDATE messages SET read = 1 WHERE id IN (${ids})`);
+          // Notifier les expéditeurs que leurs messages sont délivrés
+          for (const m of pending) {
+            push(m.from_id, { type: "msg-delivered", msgId: m.id });
+          }
           for (const m of pending) {
             ws.send(JSON.stringify({
               type: "message",
@@ -145,6 +150,13 @@ wss.on("connection", (ws) => {
       // Signaling WebRTC
       if (["call-offer","call-answer","call-reject","call-end","ice-candidate"].includes(msg.type)) {
         if (msg.to) push(msg.to, { ...msg, from: myId });
+      }
+
+      // Confirmation de lecture
+      if (msg.type === "msg-seen" && msg.msgId && myId) {
+        db.prepare("UPDATE messages SET seen = 1 WHERE id = ?").run(msg.msgId);
+        const m = db.prepare("SELECT from_id FROM messages WHERE id = ?").get(msg.msgId);
+        if (m) push(m.from_id, { type: "msg-seen", msgId: msg.msgId, by: myId });
       }
 
     } catch {}
@@ -286,7 +298,11 @@ app.post("/messages", (req, res) => {
     isVoice: !!isVoice
   });
 
-  if (clients.has(to)) db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
+  // Si destinataire connecté — marquer delivered et notifier expéditeur
+  if (clients.has(to)) {
+    db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
+    push(from, { type: "msg-delivered", msgId: id });
+  }
 
   console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey}`);
   res.json({ id, ts });
@@ -304,6 +320,10 @@ app.get("/messages/:userId", (req, res) => {
 
   if (msgs.length > 0) {
     db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
+    // Notifier les expéditeurs que leurs messages sont délivrés
+    for (const m of msgs) {
+      push(m.from_id, { type: "msg-delivered", msgId: m.id });
+    }
   }
 
   res.json(msgs.map(m => ({
