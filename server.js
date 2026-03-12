@@ -303,13 +303,35 @@ app.post("/messages", (req, res) => {
   });
 
   // Si destinataire connecté — marquer delivered et notifier expéditeur
-  if (clients.has(to)) {
+  // Pour mediaGroup, ne pas marquer read=1 tout de suite — le destinataire doit fetch les données
+  if (clients.has(to) && !mediaGroup) {
     db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
+    push(from, { type: "msg-delivered", msgId: id });
+  } else if (clients.has(to) && mediaGroup) {
     push(from, { type: "msg-delivered", msgId: id });
   }
 
   console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey}`);
   res.json({ id, ts });
+});
+
+app.get("/messages/fetch/:id", (req, res) => {
+  const { id } = req.params;
+  const m = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at, media_group FROM messages WHERE id = ?`).get(id);
+  if (!m) return res.status(404).json({ error: "Introuvable" });
+  db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
+  res.json({
+    id: m.id, from: m.from_id, to: m.to_id,
+    encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
+    hasFile: m.has_file === 1,
+    fileName: m.file_name,
+    fileData: m.file_data,
+    fileType: m.file_type || "",
+    ts: m.ts,
+    nokey: m.nokey === 1,
+    isVoice: m.is_voice === 1,
+    mediaGroup: m.media_group ? JSON.parse(m.media_group) : null
+  });
 });
 
 app.get("/messages/:userId", (req, res) => {
