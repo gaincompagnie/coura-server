@@ -71,7 +71,7 @@ setInterval(() => {
 
 // ── Middlewares ─────────────────────────────────────
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "100mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // ── Registre WebSocket ──────────────────────────────
@@ -275,7 +275,7 @@ app.post("/messages", (req, res) => {
   const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice, mediaGroup } = req.body;
   if (!from || !to || (!encrypted && !hasFile && !mediaGroup)) return res.status(400).json({ error: "Paramètres manquants" });
   if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
-  if (encrypted && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
+  if (encrypted && !mediaGroup && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
 
   const id = randomUUID(), ts = Date.now();
   const liveDuration = Math.min(Math.max(parseInt(ttl) || 86400, 60), 604800);
@@ -296,7 +296,7 @@ app.post("/messages", (req, res) => {
     fileName: fileName || null,
     fileData: fileData || null,
     fileType: fileType || "",
-    mediaGroup: mediaGroup || null,
+    mediaGroup: mediaGroup ? "__fetch__" : null,
     ts, ttl: liveDuration,
     nokey: !!nokey,
     isVoice: !!isVoice
