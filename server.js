@@ -33,7 +33,10 @@ db.exec(`
     nokey       INTEGER DEFAULT 0,
     is_voice    INTEGER DEFAULT 0,
     file_type   TEXT,
-    media_group TEXT
+    media_group TEXT,
+    group_id    TEXT,
+    group_total INTEGER DEFAULT 1,
+    group_index INTEGER DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS users (
     id         TEXT PRIMARY KEY,
@@ -272,7 +275,7 @@ app.delete("/sessions/:userId/:peerId", (req, res) => {
 // ── Messages ─────────────────────────────────────────
 
 app.post("/messages", (req, res) => {
-  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice, mediaGroup } = req.body;
+  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice, mediaGroup, groupId, groupTotal, groupIndex } = req.body;
   if (!from || !to || (!encrypted && !hasFile && !mediaGroup)) return res.status(400).json({ error: "Paramètres manquants" });
   if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
   if (encrypted && !mediaGroup && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
@@ -285,9 +288,9 @@ app.post("/messages", (req, res) => {
   const mediaGroupStr = mediaGroup ? JSON.stringify(mediaGroup) : null;
 
   db.prepare(`
-    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, expires_at, nokey, is_voice, media_group)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0, mediaGroupStr);
+    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, expires_at, nokey, is_voice, media_group, group_id, group_total, group_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0, mediaGroupStr, groupId || null, groupTotal || 1, groupIndex || 0);
 
   push(to, {
     type: "message", id, from, to,
@@ -297,6 +300,9 @@ app.post("/messages", (req, res) => {
     fileData: fileData || null,
     fileType: fileType || "",
     mediaGroup: mediaGroup ? "__fetch__" : null,
+    groupId: groupId || null,
+    groupTotal: groupTotal || 1,
+    groupIndex: groupIndex || 0,
     ts, ttl: liveDuration,
     nokey: !!nokey,
     isVoice: !!isVoice
@@ -317,7 +323,7 @@ app.post("/messages", (req, res) => {
 
 app.get("/messages/fetch/:id", (req, res) => {
   const { id } = req.params;
-  const m = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at, media_group FROM messages WHERE id = ?`).get(id);
+  const m = db.prepare(`SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at, media_group, group_id, group_total, group_index FROM messages WHERE id = ?`).get(id);
   if (!m) return res.status(404).json({ error: "Introuvable" });
   db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
   res.json({
@@ -330,7 +336,10 @@ app.get("/messages/fetch/:id", (req, res) => {
     ts: m.ts,
     nokey: m.nokey === 1,
     isVoice: m.is_voice === 1,
-    mediaGroup: m.media_group ? JSON.parse(m.media_group) : null
+    mediaGroup: m.media_group ? JSON.parse(m.media_group) : null,
+    groupId: m.group_id || null,
+    groupTotal: m.group_total || 1,
+    groupIndex: m.group_index || 0
   });
 });
 
@@ -339,7 +348,7 @@ app.get("/messages/:userId", (req, res) => {
   if (!userId || userId.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
   const now = Date.now();
   const msgs = db.prepare(`
-    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at, media_group
+    SELECT id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, nokey, is_voice, expires_at, media_group, group_id, group_total, group_index
     FROM messages WHERE to_id = ? AND read = 0 AND expires_at > ?
     ORDER BY ts ASC
   `).all(userId, now);
@@ -363,7 +372,10 @@ app.get("/messages/:userId", (req, res) => {
     ttl: Math.round((m.expires_at - m.ts) / 1000),
     nokey: m.nokey === 1,
     isVoice: m.is_voice === 1,
-    mediaGroup: m.media_group ? JSON.parse(m.media_group) : null
+    mediaGroup: m.media_group ? JSON.parse(m.media_group) : null,
+    groupId: m.group_id || null,
+    groupTotal: m.group_total || 1,
+    groupIndex: m.group_index || 0
   })));
 });
 
