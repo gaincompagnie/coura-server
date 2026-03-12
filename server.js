@@ -70,7 +70,7 @@ setInterval(() => {
 
 // ── Middlewares ─────────────────────────────────────
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "50mb" })); // ← augmenté pour supporter mediaGroup
 app.use(express.static(path.join(__dirname, "public")));
 
 // ── Registre WebSocket ──────────────────────────────
@@ -124,19 +124,21 @@ wss.on("connection", (ws) => {
         if (pending.length > 0) {
           const ids = pending.map(m => `'${m.id}'`).join(",");
           db.exec(`UPDATE messages SET read = 1 WHERE id IN (${ids})`);
-          // Notifier les expéditeurs que leurs messages sont délivrés
           for (const m of pending) {
             push(m.from_id, { type: "msg-delivered", msgId: m.id });
           }
           for (const m of pending) {
+            // Détecter si file_data contient un mediaGroup (tableau JSON)
+            const isMediaGroup = m.file_data && m.file_data.startsWith("[");
             ws.send(JSON.stringify({
               type: "message",
               id: m.id, from: m.from_id, to: m.to_id,
               encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
               hasFile: m.has_file === 1,
               fileName: m.file_name,
-              fileData: m.file_data,
+              fileData: isMediaGroup ? null : m.file_data,
               fileType: m.file_type || "",
+              mediaGroup: isMediaGroup ? JSON.parse(m.file_data) : null,
               ts: m.ts,
               ttl: Math.round((m.expires_at - m.ts) / 1000),
               nokey: m.nokey === 1,
@@ -186,7 +188,6 @@ app.get("/user/:userId", (req, res) => {
 // PREKEYS — Clés publiques pour chiffrement E2E
 // ══════════════════════════════════════════════════════
 
-// Déposer sa clé publique sur le serveur
 app.post("/keys/register", (req, res) => {
   const { userId, publicKey } = req.body;
   if (!userId || !publicKey) return res.status(400).json({ error: "userId et publicKey requis" });
@@ -200,7 +201,6 @@ app.post("/keys/register", (req, res) => {
   res.json({ ok: true });
 });
 
-// Récupérer la clé publique d'un utilisateur
 app.get("/keys/:userId", (req, res) => {
   const userId = req.params.userId.toUpperCase();
   const row = db.prepare("SELECT public_key FROM keys WHERE user_id = ?").get(userId);
@@ -210,16 +210,12 @@ app.get("/keys/:userId", (req, res) => {
 
 // ══════════════════════════════════════════════════════
 // SESSIONS — État Double Ratchet chiffré
-// Le serveur stocke l'état de session chiffré côté client
-// Il ne peut pas le lire — il est chiffré avec les clés des utilisateurs
 // ══════════════════════════════════════════════════════
 
-// Obtenir l'ID de session canonique (toujours A < B alphabétiquement)
 function sessionId(a, b) {
   return [a, b].sort().join(":");
 }
 
-// Sauvegarder l'état de session d'un utilisateur
 app.post("/sessions/:userId", (req, res) => {
   const userId = req.params.userId.toUpperCase();
   const { peerId, state } = req.body;
@@ -231,11 +227,9 @@ app.post("/sessions/:userId", (req, res) => {
   const now = Date.now();
 
   if (existing) {
-    // Mettre à jour l'état de l'utilisateur concerné
     const col = existing.user_a === userId ? "state_a" : "state_b";
     db.prepare(`UPDATE sessions SET ${col} = ?, updated_at = ? WHERE session_id = ?`).run(state, now, sid);
   } else {
-    // Créer la session
     const [userA, userB] = [userId, peerId.toUpperCase()].sort();
     const stateA = userA === userId ? state : null;
     const stateB = userB === userId ? state : null;
@@ -246,7 +240,6 @@ app.post("/sessions/:userId", (req, res) => {
   res.json({ ok: true });
 });
 
-// Récupérer l'état de session pour un utilisateur
 app.get("/sessions/:userId/:peerId", (req, res) => {
   const userId = req.params.userId.toUpperCase();
   const peerId = req.params.peerId.toUpperCase();
@@ -254,12 +247,10 @@ app.get("/sessions/:userId/:peerId", (req, res) => {
   const session = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(sid);
   if (!session) return res.status(404).json({ error: "Session introuvable" });
 
-  // Retourner l'état de l'utilisateur demandeur
   const state = session.user_a === userId ? session.state_a : session.state_b;
   res.json({ state: state || null });
 });
 
-// Supprimer une session (reset des clés)
 app.delete("/sessions/:userId/:peerId", (req, res) => {
   const userId = req.params.userId.toUpperCase();
   const peerId = req.params.peerId.toUpperCase();
@@ -271,8 +262,8 @@ app.delete("/sessions/:userId/:peerId", (req, res) => {
 // ── Messages ─────────────────────────────────────────
 
 app.post("/messages", (req, res) => {
-  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice } = req.body;
-  if (!from || !to || (!encrypted && !hasFile)) return res.status(400).json({ error: "Paramètres manquants" });
+  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice, mediaGroup } = req.body;
+  if (!from || !to) return res.status(400).json({ error: "Paramètres manquants" });
   if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
   if (encrypted && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
 
@@ -281,30 +272,33 @@ app.post("/messages", (req, res) => {
   const expires_at = ts + liveDuration * 1000;
   const encStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
 
+  // Si mediaGroup, on stocke le tableau JSON dans file_data
+  const storedFileData = mediaGroup ? JSON.stringify(mediaGroup) : (fileData || null);
+
   db.prepare(`
     INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, expires_at, nokey, is_voice)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0);
+  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, storedFileData, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0);
 
   push(to, {
     type: "message", id, from, to,
     encrypted: encrypted || "",
     hasFile: !!hasFile,
     fileName: fileName || null,
-    fileData: fileData || null,
+    fileData: mediaGroup ? null : (fileData || null),
     fileType: fileType || "",
+    mediaGroup: mediaGroup || null,
     ts, ttl: liveDuration,
     nokey: !!nokey,
     isVoice: !!isVoice
   });
 
-  // Si destinataire connecté — marquer delivered et notifier expéditeur
   if (clients.has(to)) {
     db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
     push(from, { type: "msg-delivered", msgId: id });
   }
 
-  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey}`);
+  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey} | mediaGroup=${mediaGroup ? mediaGroup.length : 0}`);
   res.json({ id, ts });
 });
 
@@ -320,24 +314,27 @@ app.get("/messages/:userId", (req, res) => {
 
   if (msgs.length > 0) {
     db.exec(`UPDATE messages SET read = 1 WHERE id IN (${msgs.map(m => `'${m.id}'`).join(",")})`);
-    // Notifier les expéditeurs que leurs messages sont délivrés
     for (const m of msgs) {
       push(m.from_id, { type: "msg-delivered", msgId: m.id });
     }
   }
 
-  res.json(msgs.map(m => ({
-    id: m.id, from: m.from_id, to: m.to_id,
-    encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
-    hasFile: m.has_file === 1,
-    fileName: m.file_name,
-    fileData: m.file_data,
-    fileType: m.file_type || "",
-    ts: m.ts,
-    ttl: Math.round((m.expires_at - m.ts) / 1000),
-    nokey: m.nokey === 1,
-    isVoice: m.is_voice === 1
-  })));
+  res.json(msgs.map(m => {
+    const isMediaGroup = m.file_data && m.file_data.startsWith("[");
+    return {
+      id: m.id, from: m.from_id, to: m.to_id,
+      encrypted: m.encrypted ? Buffer.from(m.encrypted, 'base64').toString('utf8') : "",
+      hasFile: m.has_file === 1,
+      fileName: m.file_name,
+      fileData: isMediaGroup ? null : m.file_data,
+      fileType: m.file_type || "",
+      mediaGroup: isMediaGroup ? JSON.parse(m.file_data) : null,
+      ts: m.ts,
+      ttl: Math.round((m.expires_at - m.ts) / 1000),
+      nokey: m.nokey === 1,
+      isVoice: m.is_voice === 1
+    };
+  }));
 });
 
 app.delete("/messages/:id", (req, res) => {
