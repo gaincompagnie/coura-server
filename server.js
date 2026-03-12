@@ -15,6 +15,13 @@ const server = createServer(app);
 const wss    = new WebSocketServer({ server });
 const PORT   = process.env.PORT || 3000;
 
+// ── Migration colonnes manquantes ──────────────────
+try { db.exec(`ALTER TABLE messages ADD COLUMN media_group TEXT`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN group_id TEXT`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN group_total INTEGER DEFAULT 1`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN group_index INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN seen INTEGER DEFAULT 0`); } catch {}
+
 // ── Base de données SQLite ──────────────────────────
 const db = new Database("coura.db");
 
