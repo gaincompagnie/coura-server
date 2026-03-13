@@ -9,6 +9,11 @@ const Database   = require("better-sqlite3");
 const cors       = require("cors");
 const { randomUUID } = require("crypto");
 const path       = require("path");
+const fs         = require("fs");
+
+// Dossier uploads
+const UPLOADS_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
 const app    = express();
 const server = createServer(app);
@@ -72,6 +77,8 @@ try { db.exec(`ALTER TABLE messages ADD COLUMN nokey INTEGER DEFAULT 0`); } catc
 try { db.exec(`ALTER TABLE messages ADD COLUMN seen INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE messages ADD COLUMN is_voice INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE messages ADD COLUMN file_type TEXT`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN file_url TEXT`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN file_size INTEGER`); } catch {}
 
 // ── Nettoyage auto ──────────────────────────────────
 setInterval(() => {
@@ -81,8 +88,9 @@ setInterval(() => {
 
 // ── Middlewares ─────────────────────────────────────
 app.use(cors());
-app.use(express.json({ limit: "100mb" }));
+app.use(express.json({ limit: "50mb" }));
 app.use(express.static(path.join(__dirname, "public")));
+app.use("/files", express.static(UPLOADS_DIR));
 
 // ── Registre WebSocket ──────────────────────────────
 const clients = new Map();
@@ -279,32 +287,59 @@ app.delete("/sessions/:userId/:peerId", (req, res) => {
   res.json({ deleted: true });
 });
 
+
+// ── Upload fichier chiffré ────────────────────────────
+app.post("/files", (req, res) => {
+  const fileId = randomUUID();
+  const ext = req.headers["x-file-ext"] || "bin";
+  const fileName = fileId + "." + ext;
+  const filePath = path.join(UPLOADS_DIR, fileName);
+  const chunks = [];
+
+  req.on("data", chunk => chunks.push(chunk));
+  req.on("end", () => {
+    const buf = Buffer.concat(chunks);
+    fs.writeFile(filePath, buf, (err) => {
+      if (err) return res.status(500).json({ error: "Erreur écriture" });
+      const fileUrl = "/files/" + fileName;
+      console.log(`[file] Upload ${fileName} (${buf.length} bytes)`);
+      res.json({ fileId, fileUrl, size: buf.length });
+    });
+  });
+  req.on("error", () => res.status(500).json({ error: "Erreur upload" }));
+});
+
+// ── Supprimer fichier lié à un message ────────────────
 // ── Messages ─────────────────────────────────────────
 
 app.post("/messages", (req, res) => {
-  const { from, to, encrypted, hasFile, fileName, fileData, fileType, ttl, nokey, isVoice, mediaGroup, groupId, groupTotal, groupIndex } = req.body;
+  const { from, to, encrypted, hasFile, fileName, fileData, fileType, fileUrl, fileSize, ttl, nokey, isVoice, mediaGroup, groupId, groupTotal, groupIndex } = req.body;
   if (!from || !to || (!encrypted && !hasFile && !mediaGroup)) return res.status(400).json({ error: "Paramètres manquants" });
   if (from.length > 20 || to.length > 20) return res.status(400).json({ error: "Identifiant invalide" });
-  if (encrypted && !mediaGroup && encrypted.length > 500_000) return res.status(400).json({ error: "Message trop long" });
 
   const id = randomUUID(), ts = Date.now();
   const liveDuration = Math.min(Math.max(parseInt(ttl) || 86400, 60), 604800);
   const expires_at = ts + liveDuration * 1000;
   const encStored = Buffer.from(encrypted || "", 'utf8').toString('base64');
-
   const mediaGroupStr = mediaGroup ? JSON.stringify(mediaGroup) : null;
 
+  // Si fileUrl fourni → nouveau système (fichier uploadé séparément)
+  // Sinon → ancien système (fileData inline) pour rétrocompatibilité
+  const storedFileData = fileUrl ? null : (fileData || null);
+
   db.prepare(`
-    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, ts, expires_at, nokey, is_voice, media_group, group_id, group_total, group_index)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, fileData || null, fileType || null, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0, mediaGroupStr, groupId || null, groupTotal || 1, groupIndex || 0);
+    INSERT INTO messages (id, from_id, to_id, encrypted, has_file, file_name, file_data, file_type, file_url, file_size, ts, expires_at, nokey, is_voice, media_group, group_id, group_total, group_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, from, to, encStored, hasFile ? 1 : 0, fileName || null, storedFileData, fileType || null, fileUrl || null, fileSize || 0, ts, expires_at, nokey ? 1 : 0, isVoice ? 1 : 0, mediaGroupStr, groupId || null, groupTotal || 1, groupIndex || 0);
 
   push(to, {
     type: "message", id, from, to,
     encrypted: encrypted || "",
     hasFile: !!hasFile,
     fileName: fileName || null,
-    fileData: fileData || null,
+    fileData: fileUrl ? null : (fileData || null), // ne pas envoyer fileData si fileUrl présent
+    fileUrl: fileUrl || null,
+    fileSize: fileSize || 0,
     fileType: fileType || "",
     mediaGroup: mediaGroup ? "__fetch__" : null,
     groupId: groupId || null,
@@ -315,8 +350,6 @@ app.post("/messages", (req, res) => {
     isVoice: !!isVoice
   });
 
-  // Si destinataire connecté — marquer delivered et notifier expéditeur
-  // Pour mediaGroup, ne pas marquer read=1 tout de suite — le destinataire doit fetch les données
   if (clients.has(to) && !mediaGroup) {
     db.prepare("UPDATE messages SET read = 1 WHERE id = ?").run(id);
     push(from, { type: "msg-delivered", msgId: id });
@@ -324,7 +357,7 @@ app.post("/messages", (req, res) => {
     push(from, { type: "msg-delivered", msgId: id });
   }
 
-  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey} | groupId=${groupId||"none"} | groupTotal=${groupTotal||1}`);
+  console.log(`[msg] ${from} → ${to} | ${id.slice(0,8)} | nokey=${nokey} | file=${fileUrl||fileData?"oui":"non"}`);
   res.json({ id, ts });
 });
 
@@ -388,10 +421,16 @@ app.get("/messages/:userId", (req, res) => {
 
 app.delete("/messages/:id", (req, res) => {
   const { id } = req.params;
-  const msg = db.prepare("SELECT id, to_id FROM messages WHERE id = ?").get(id);
+  const msg = db.prepare("SELECT id, to_id, from_id, file_url FROM messages WHERE id = ?").get(id);
   if (!msg) return res.status(404).json({ error: "Message introuvable" });
+  // Supprimer le fichier si présent
+  if (msg.file_url) {
+    const fp = path.join(UPLOADS_DIR, path.basename(msg.file_url));
+    try { fs.unlinkSync(fp); } catch {}
+  }
   db.prepare("DELETE FROM messages WHERE id = ?").run(id);
   push(msg.to_id, { type: "deleted", id });
+  push(msg.from_id, { type: "deleted", id });
   res.json({ deleted: true });
 });
 
