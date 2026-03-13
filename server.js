@@ -324,7 +324,7 @@ app.post("/messages", (req, res) => {
     push(from, { type: "msg-delivered", msgId: id });
   }
 
-  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey}`);
+  console.log(`[msg] ${from} → ${to} | ${id.slice(0, 8)} | nokey=${nokey} | groupId=${groupId||"none"} | groupTotal=${groupTotal||1}`);
   res.json({ id, ts });
 });
 
