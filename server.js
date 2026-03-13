@@ -11,9 +11,15 @@ const { randomUUID } = require("crypto");
 const path       = require("path");
 const fs         = require("fs");
 
-// Dossier uploads
-const UPLOADS_DIR = path.join(__dirname, "uploads");
+// Dossier persistant — Railway Volume monté sur /data
+// En local : utilise __dirname
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
+const DB_PATH = path.join(DATA_DIR, "coura.db");
+
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+console.log(`[init] DB: ${DB_PATH}`);
+console.log(`[init] Uploads: ${UPLOADS_DIR}`);
 
 const app    = express();
 const server = createServer(app);
@@ -28,7 +34,7 @@ try { db.exec(`ALTER TABLE messages ADD COLUMN group_index INTEGER DEFAULT 0`); 
 try { db.exec(`ALTER TABLE messages ADD COLUMN seen INTEGER DEFAULT 0`); } catch {}
 
 // ── Base de données SQLite ──────────────────────────
-const db = new Database("coura.db");
+const db = new Database(DB_PATH);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
