@@ -11,9 +11,8 @@ const { randomUUID } = require("crypto");
 const path       = require("path");
 const fs         = require("fs");
 
-// Dossier persistant — Railway Volume monté sur /data
-// En local : utilise __dirname
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+// Disque éphémère Railway — pas de volume
+const DATA_DIR = __dirname;
 const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 const DB_PATH = path.join(DATA_DIR, "coura.db");
 
@@ -295,15 +294,28 @@ app.delete("/sessions/:userId/:peerId", (req, res) => {
 
 
 // ── Upload fichier chiffré ────────────────────────────
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 Mo
+
 app.post("/files", (req, res) => {
   const fileId = randomUUID();
   const ext = req.headers["x-file-ext"] || "bin";
   const fileName = fileId + "." + ext;
   const filePath = path.join(UPLOADS_DIR, fileName);
   const chunks = [];
+  let totalSize = 0;
+  let aborted = false;
 
-  req.on("data", chunk => chunks.push(chunk));
+  req.on("data", chunk => {
+    totalSize += chunk.length;
+    if (totalSize > MAX_FILE_SIZE) {
+      aborted = true;
+      req.destroy();
+      return res.status(413).json({ error: "Fichier trop volumineux (max 100 Mo)" });
+    }
+    chunks.push(chunk);
+  });
   req.on("end", () => {
+    if (aborted) return;
     const buf = Buffer.concat(chunks);
     fs.writeFile(filePath, buf, (err) => {
       if (err) return res.status(500).json({ error: "Erreur écriture" });
@@ -312,7 +324,7 @@ app.post("/files", (req, res) => {
       res.json({ fileId, fileUrl, size: buf.length });
     });
   });
-  req.on("error", () => res.status(500).json({ error: "Erreur upload" }));
+  req.on("error", () => { if (!aborted) res.status(500).json({ error: "Erreur upload" }); });
 });
 
 // ── Supprimer fichier lié à un message ────────────────
